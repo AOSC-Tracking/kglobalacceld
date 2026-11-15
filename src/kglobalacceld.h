@@ -11,6 +11,7 @@
 
 #include "kglobalacceld_export.h"
 
+#include "kglobalaccel_interface.h"
 #include "shortcutkeystate.h"
 #include <kglobalshortcutinfo.h>
 
@@ -48,6 +49,8 @@ public:
     ~KGlobalAccelD() override;
 
     bool init();
+
+    KGlobalAccelInterface *interface() const;
 
     bool keyEvent(int keyQt, ShortcutKeyState state);
     bool pointerPressed(Qt::MouseButtons pointerButtons);

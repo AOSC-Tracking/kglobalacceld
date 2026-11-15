@@ -161,6 +161,11 @@ KGlobalAccelD::KGlobalAccelD()
     d->m_registry = std::make_unique<GlobalShortcutsRegistry>();
 }
 
+KGlobalAccelInterface *KGlobalAccelD::interface() const
+{
+    return d->m_registry->interface();
+}
+
 bool KGlobalAccelD::init()
 {
     qDBusRegisterMetaType<QKeySequence>();

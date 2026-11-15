@@ -11,23 +11,75 @@
 #include "component.h"
 #include "globalshortcut.h"
 #include "globalshortcutcontext.h"
+#include "kglobalaccel_interface.h"
 #include "kglobalshortcutinfo_p.h"
 #include "kserviceactioncomponent.h"
 #include "logging.h"
 #include "sequencehelpers_p.h"
+#include <config-kglobalaccel.h>
 
 #include <KApplicationTrader>
 #include <KDesktopFile>
 #include <KFileUtils>
+#include <KPluginMetaData>
 #include <KSycoca>
+#include <KWindowSystem>
 
 #include <QDBusConnection>
 #include <QDir>
+#include <QGuiApplication>
+#include <QJsonArray>
+#include <QPluginLoader>
 #include <QStandardPaths>
 
 #include <algorithm>
 
 using namespace Qt::StringLiterals;
+
+static bool checkPlatform(const QJsonObject &metadata, const QString &platformName)
+{
+    const QJsonArray platforms = metadata.value(QStringLiteral("MetaData")).toObject().value(QStringLiteral("platforms")).toArray();
+    return std::any_of(platforms.begin(), platforms.end(), [&platformName](const QJsonValue &value) {
+        return QString::compare(platformName, value.toString(), Qt::CaseInsensitive) == 0;
+    });
+}
+
+static KGlobalAccelInterface *loadPlugin(GlobalShortcutsRegistry *parent)
+{
+    QString platformName = QString::fromLocal8Bit(qgetenv("KGLOBALACCELD_PLATFORM"));
+    if (platformName.isEmpty()) {
+        platformName = QGuiApplication::platformName();
+    }
+
+    const QList<QStaticPlugin> staticPlugins = QPluginLoader::staticPlugins();
+    for (const QStaticPlugin &staticPlugin : staticPlugins) {
+        const QJsonObject metadata = staticPlugin.metaData();
+        if (metadata.value(QLatin1String("IID")) != QLatin1String(KGlobalAccelInterface_iid)) {
+            continue;
+        }
+        if (checkPlatform(metadata, platformName)) {
+            if (auto *interface = qobject_cast<KGlobalAccelInterface *>(staticPlugin.instance())) {
+                interface->setRegistry(parent);
+                return interface;
+            }
+        }
+    }
+
+    const QList<KPluginMetaData> candidates = KPluginMetaData::findPlugins(QStringLiteral("org.kde.kglobalacceld.platforms"));
+    for (const KPluginMetaData &candidate : candidates) {
+        QPluginLoader loader(candidate.fileName());
+        if (!checkPlatform(loader.metaData(), platformName)) {
+            continue;
+        }
+        if (auto *interface = qobject_cast<KGlobalAccelInterface *>(loader.instance())) {
+            interface->setRegistry(parent);
+            return interface;
+        }
+    }
+
+    qCWarning(KGLOBALACCELD) << "Could not find any platform plugin";
+    return nullptr;
+}
 
 void GlobalShortcutsRegistry::migrateKHotkeys()
 {
@@ -235,10 +287,13 @@ GlobalShortcutsRegistry::GlobalShortcutsRegistry()
     m_refreshServicesTimer.setSingleShot(true);
     m_refreshServicesTimer.setInterval(0);
     connect(&m_refreshServicesTimer, &QTimer::timeout, this, &GlobalShortcutsRegistry::refreshServices);
+
+    _manager = loadPlugin(this);
 }
 
 GlobalShortcutsRegistry::~GlobalShortcutsRegistry()
 {
+    delete _manager;
     m_components.clear();
     _active_keys.clear();
 }
@@ -334,14 +389,31 @@ QList<GlobalShortcut *> GlobalShortcutsRegistry::getShortcutsByKey(const QKeySeq
 
 GlobalShortcut *GlobalShortcutsRegistry::activeShortcutByKey(const QKeySequence &keySequence) const
 {
-    const auto range = _active_keys.equal_range(keySequence);
-    if (range.first == range.second) {
-        return nullptr;
+    QVarLengthArray<GlobalShortcut *, 4> shortcuts;
+
+    // On X11, kglobalacceld fails to grab some modifier keys, so _active_keys doesn't contain those
+    // shortcuts. On Wayland, everything works as expected. Given that the X11 code is on its way out,
+    // make this function go through all available shortcuts to match the previous behavior.
+    if (KWindowSystem::isPlatformX11()) {
+        for (const ComponentPtr &component : m_components) {
+            const auto candidates = component->getShortcutsByKey(keySequence, KGlobalAccel::Equal);
+            for (const auto candidate : candidates) {
+                shortcuts.append(candidate);
+            }
+        }
+    } else {
+        // TODO: Ensure that we operate with normalized keys so the lookup time can be O(1) on average instead of O(N).
+        const QKeySequence normalizedKeySequence = Utils::normalizeSequence(keySequence);
+        for (const auto &[candidateKeySequence, shortcut] : _active_keys.asKeyValueRange()) {
+            const QKeySequence normalizedCandidateKeySequence = Utils::normalizeSequence(candidateKeySequence);
+            if (normalizedKeySequence == normalizedCandidateKeySequence) {
+                shortcuts.append(shortcut);
+            }
+        }
     }
 
-    QVarLengthArray<GlobalShortcut *, 4> shortcuts;
-    for (auto it = range.first; it != range.second; ++it) {
-        shortcuts.append(*it);
+    if (shortcuts.isEmpty()) {
+        return nullptr;
     }
 
     if (shortcuts.size() == 1) {
@@ -780,6 +852,9 @@ void GlobalShortcutsRegistry::detectAppsWithShortcuts()
 
 bool GlobalShortcutsRegistry::registerKey(const QKeySequence &key, GlobalShortcut *shortcut)
 {
+    if (!_manager) {
+        return false;
+    }
     if (key.isEmpty()) {
         qCDebug(KGLOBALACCELD) << shortcut->uniqueName() << ": Attempt to register key 0.";
         return false;
@@ -790,6 +865,39 @@ bool GlobalShortcutsRegistry::registerKey(const QKeySequence &key, GlobalShortcu
     qCDebug(KGLOBALACCELD) << "Registering key" << QKeySequence(key).toString() << "for" << shortcut->context()->component()->uniqueName() << ":"
                            << shortcut->uniqueName();
 
+    bool error = false;
+    int i;
+    for (i = 0; i < key.count(); i++) {
+        const int combined = key[i].toCombined();
+        auto it = _keys_count.find(combined);
+        if (it != _keys_count.end()) {
+            ++*it;
+            continue;
+        }
+        if (!_manager->grabKey(combined, true)) {
+            error = true;
+            break;
+        }
+        ++_keys_count[combined];
+    }
+
+    if (error) {
+        for (--i; i >= 0; --i) {
+            const int combined = key[i].toCombined();
+            auto it = _keys_count.find(combined);
+            if (it == _keys_count.end()) {
+                continue;
+            }
+            if (it.value() == 1) {
+                _keys_count.erase(it);
+                _manager->grabKey(combined, false);
+            } else {
+                --(it.value());
+            }
+        }
+        return false;
+    }
+
     _active_keys.insert(key, shortcut);
 
     return true;
@@ -797,9 +905,26 @@ bool GlobalShortcutsRegistry::registerKey(const QKeySequence &key, GlobalShortcu
 
 bool GlobalShortcutsRegistry::unregisterKey(const QKeySequence &key, GlobalShortcut *shortcut)
 {
+    if (!_manager) {
+        return false;
+    }
     if (!_active_keys.contains(key, shortcut)) {
         // The shortcut doesn't own the key or the key isn't grabbed
         return false;
+    }
+
+    for (int i = 0; i < key.count(); i++) {
+        auto iter = _keys_count.find(key[i].toCombined());
+        if ((iter == _keys_count.end()) || (iter.value() <= 0)) {
+            continue;
+        }
+
+        if (iter.value() == 1) {
+            _manager->grabKey(key[i].toCombined(), false);
+            _keys_count.erase(iter);
+        } else {
+            --(iter.value());
+        }
     }
 
     if (shortcut && shortcut == m_lastShortcut) {
@@ -870,6 +995,21 @@ void GlobalShortcutsRegistry::refreshServices()
 
     // Look for new apps with shortcuts
     detectAppsWithShortcuts();
+}
+
+void GlobalShortcutsRegistry::grabKeys()
+{
+    activateShortcuts();
+}
+
+void GlobalShortcutsRegistry::ungrabKeys()
+{
+    deactivateShortcuts();
+}
+
+KGlobalAccelInterface *GlobalShortcutsRegistry::interface() const
+{
+    return _manager;
 }
 
 uint64_t GlobalShortcutsRegistry::nextSerial()

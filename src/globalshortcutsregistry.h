@@ -29,6 +29,7 @@
 
 class Component;
 class GlobalShortcut;
+class KGlobalAccelInterface;
 
 /**
  * Global Shortcut Registry.
@@ -117,6 +118,8 @@ public:
 
     bool unregisterKey(const QKeySequence &key, GlobalShortcut *shortcut);
 
+    KGlobalAccelInterface *interface() const;
+
     /**
      * Generates the next available global shortcut serial. Global shortcut serials increase
      * monotonically, 1 is the first valid serial. The serial describes the time when the global
@@ -132,6 +135,10 @@ public Q_SLOTS:
 
     void writeSettings();
 
+    void grabKeys();
+
+    void ungrabKeys();
+
 Q_SIGNALS:
     void needsSave();
 
@@ -139,6 +146,7 @@ private:
     friend struct KGlobalAccelDPrivate;
     friend class Component;
     friend class KGlobalAccelD;
+    friend class KGlobalAccelInterface;
 
     Component *createComponent(const QString &uniqueName, const QString &friendlyName);
     KServiceActionComponent *createServiceActionComponent(const QString &uniqueName);
@@ -164,6 +172,7 @@ private:
 
     QMultiHash<QKeySequence, GlobalShortcut *> _active_keys;
     QKeySequence _active_sequence;
+    QHash<int, int> _keys_count;
 
     Qt::KeyboardModifiers m_currentModifiers;
     // State machine:
@@ -235,6 +244,8 @@ private:
      * Check whether a shortcut is permitted when the allow-list is active.
      */
     bool isShortcutAllowed(const GlobalShortcut *shortcut) const;
+
+    KGlobalAccelInterface *_manager = nullptr;
 
     GlobalShortcut *m_lastShortcut = nullptr;
     QTimer m_refreshServicesTimer;
